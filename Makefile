@@ -2,7 +2,7 @@ VENV ?= .venv
 PY   := $(VENV)/bin/python
 PIP  := $(VENV)/bin/pip
 
-.PHONY: install load-data reset-data build-data serve benchmark benchmark-corpus test clean
+.PHONY: install load-data load-data-trec-dl reset-data reset-data-trec-dl build-data serve benchmark benchmark-corpus benchmark-trec-dl test clean
 
 install:
 	python3 -m venv $(VENV)
@@ -12,10 +12,18 @@ install:
 load-data:
 	$(PY) scripts/load_corpus.py
 
+load-data-trec-dl:
+	$(PY) scripts/load_corpus.py --dataset trec-dl-2019
+
 reset-data:
 	rm -rf data
 	mkdir -p data
 	$(PY) scripts/load_corpus.py
+
+reset-data-trec-dl:
+	rm -rf data
+	mkdir -p data
+	$(PY) scripts/load_corpus.py --dataset trec-dl-2019
 
 build-data:
 	$(PY) scripts/build_gold_set.py
@@ -27,6 +35,9 @@ benchmark:
 	$(PY) scripts/benchmark.py
 
 benchmark-corpus:
+	$(PY) scripts/benchmark_corpus.py
+
+benchmark-trec-dl: reset-data-trec-dl
 	$(PY) scripts/benchmark_corpus.py
 
 test:

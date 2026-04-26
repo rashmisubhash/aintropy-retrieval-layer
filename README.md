@@ -6,15 +6,17 @@ AIntropy's retrieval problem is the standard hard case in modern search systems:
 
 ## Results
 
-**Production corpus (10k passages, 200 sampled queries):**
+**Production corpus — TREC Deep Learning 2019 (10k passages, 43 queries, graded qrels 0–3):**
 
-| Condition | NDCG@10 | Recall@10 | Recall@100 | p95 latency |
-|-----------|---------|-----------|------------|-------------|
-| Cold (vector search only) | 0.956 | 0.990 | 1.000 | 30ms (offline) / 162ms (live) |
-| Reranked (top-50 → cross-encoder → top-5) | 0.970 | 0.995 | 1.000 | 291ms (offline) |
-| Warm (semantic cache hit) | 0.968 | 0.995 | 1.000 | 8ms (live) |
+| Condition | NDCG@10 | NDCG@50 | NDCG@100 | Recall@100 | p95 latency |
+|-----------|---------|---------|----------|------------|-------------|
+| Cold (vector search only) | 0.684 | 0.716 | 0.761 | 0.725 | 36ms (offline) |
+| Reranked (top-100 → cross-encoder) | 0.769 | 0.784 | 0.796 | 0.725 | 305ms (offline) |
+| Warm (semantic cache hit) | 0.770 | 0.784 | 0.796 | 0.724 | 7.7ms (cache hit p95) |
 
-Reranker lifts NDCG@10 by **+1.4%** over cold. Semantic cache hits reduce end-to-end latency by **~95%** (162ms → 8ms). Cache hit rate on pre-warmed paraphrase clusters: **23.5%**.
+Reranker lifts NDCG@10 by **+12.4%** over cold (0.684 → 0.769). Semantic cache hits reduce latency by **~98%** (305ms → 7.7ms). Cache hit rate on pre-warmed paraphrase clusters: **23.3%**.
+
+> **Why these numbers differ from typical MS MARCO benchmarks:** earlier runs on MS MARCO dev/small produced NDCG@10 ≈ 0.95 — inflated by sparse binary annotations (~1.07 relevant passages per query, so nearly every retrieved doc "hits"). TREC DL 2019 has dense graded relevance (9,000+ passages judged per query by NIST assessors, grades 0–3), which produces honest scores. The **+12.4% reranker lift** is the real quality signal that was hidden behind the inflated baseline.
 
 ### Per-Stage Latency Breakdown (live server)
 
@@ -111,7 +113,7 @@ The reranker scores all 50 `(query, passage)` pairs with a cross-encoder fine-tu
 
 The reranked result is written to the semantic cache so future semantically-similar queries get the better-ordered result at 8ms instead of 162ms.
 
-**Quality lift:** NDCG@10 cold → reranked: **0.956 → 0.970 (+1.4%)** on the 10k production corpus.
+**Quality lift:** NDCG@10 cold → reranked: **0.684 → 0.769 (+12.4%)** on the 10k TREC DL 2019 corpus.
 
 ### 6. Per-Stage Timing — `src/timing.py`
 
@@ -172,15 +174,18 @@ Two separate offline benchmarks, plus a live-server latency probe:
 | Script | Corpus | Purpose |
 |--------|--------|---------|
 | `scripts/benchmark.py` | 1k gold-set corpus (all relevant passages) | Controlled quality check — proves the pipeline retrieves correctly under ideal conditions |
-| `scripts/benchmark_corpus.py` | 10k production corpus (relevant + random distractors) | Realistic quality and latency — used for the numbers in the Results section |
+| `scripts/benchmark_corpus.py` + MS MARCO | 10k corpus, binary qrels, ~7k queries | Broad coverage, inflated NDCG (sparse annotations) |
+| `scripts/benchmark_corpus.py` + TREC DL 2019 | 10k corpus, graded qrels 0–3, 43 queries | Honest NDCG — **primary benchmark for the Results section** |
 | `scripts/quick_bench.py` | Live server (10k ChromaDB index) | Per-stage latency breakdown against the running API |
 
-Each offline benchmark runs three conditions — **cold**, **reranked**, and **warm** — against 200 sampled queries:
+Each offline benchmark runs three conditions — **cold**, **reranked**, and **warm** — against all available queries (up to 200):
 - **Cold:** vector search only, no cache, no reranker.
 - **Reranked:** vector top-100 → cross-encoder → final ranking.
-- **Warm:** cache pre-warmed with rule-based paraphrases of 50 queries, then 200 queries evaluated. Cache hits return the pre-warmed reranked result; misses fall through to the full rerank pipeline.
+- **Warm:** cache pre-warmed with rule-based paraphrases of ~25% of eval queries, then all queries evaluated. Cache hits return the pre-warmed reranked result; misses fall through to the full rerank pipeline.
 
 Metrics: NDCG, MAP, Recall at @10 / @20 / @50 / @100 via `pytrec_eval`.
+
+TREC DL qrels use grades 0–3; `pytrec_eval` uses the raw grade values for NDCG (grade-weighted discounted gain). MAP and Recall treat grade ≥ 1 as relevant.
 
 ---
 
@@ -191,7 +196,7 @@ Metrics: NDCG, MAP, Recall at @10 / @20 / @50 / @100 via `pytrec_eval`.
 - **Hybrid retrieval:** this POC is dense-only. AIntropy's production direction includes BM25 + dense reciprocal-rank fusion. The retrieval boundary in `src/retrieval.py` is narrow enough to add this cleanly.
 - **Threshold sweep fidelity:** the current sweep uses rule-based paraphrases (synonym swaps and word shuffles) rather than LLM-generated paraphrases. Fidelity improves significantly with model-generated paraphrases.
 - **Vector store portability:** ChromaDB is right for a laptop POC. The single `.query()` call in `src/retrieval.py` is the only integration surface; swapping to Qdrant, Pinecone, or Milvus is localised.
-- **MS MARCO qrel sparsity:** each MS MARCO query has ~1.07 relevant passages on average. Recall@k against these qrels looks artificially low because the annotations undercount true relevance. This is a known dataset artifact, not a retrieval failure.
+- **Small query set for cache stats:** TREC DL 2019 has 43 queries, so cache hit-rate figures (23.3%) have high variance. Combining TREC DL 2019 + 2020 (97 queries total) would give more stable cache stats while keeping honest graded NDCG.
 
 ---
 
@@ -202,7 +207,8 @@ make install
 make load-data
 make serve
 make benchmark         # gold-set quality benchmark (1k corpus, controlled)
-make benchmark-corpus  # production corpus benchmark (10k with distractors)
+make benchmark-corpus  # production corpus benchmark (10k, MS MARCO binary qrels)
+make benchmark-trec-dl # production corpus benchmark (10k, TREC DL 2019 graded qrels)
 make test              # unit tests
 ```
 
@@ -215,19 +221,21 @@ Run `make serve` in one terminal and the benchmark commands in another.
 Build the runtime retrieval dataset and index:
 
 ```bash
-make load-data
+make load-data              # MS MARCO dev/small (binary qrels, ~7k queries)
+make load-data-trec-dl      # TREC DL 2019 (graded qrels 0-3, 43 queries)
 ```
 
 Delete local data artifacts and rebuild from scratch:
 
 ```bash
-make reset-data
+make reset-data             # wipe + rebuild from MS MARCO dev/small
+make reset-data-trec-dl     # wipe + rebuild from TREC DL 2019
 ```
 
 `make load-data` creates:
 
 - `data/corpus.parquet` — 10,000-passage corpus used by the API.
-- `data/queries.json` — 6,980 MS MARCO dev/small queries with qrels that survive the 10k corpus filter.
+- `data/queries.json` — queries with qrels surviving the 10k corpus filter. Binary format (`relevant_doc_ids`) for MS MARCO; graded format (`relevance_grades: {pid: 0-3}`) for TREC DL.
 - `data/chroma_db/` — local Chroma index for those 10,000 passages.
 
 ---
@@ -251,10 +259,10 @@ That smaller gold set exists for benchmark convenience: faster repeated offline 
 - `src/cache.py` — single-tier semantic cache (SHA-256 keyed, cosine NN, TTL, corpus versioning).
 - `src/config.py` — all constants: models, `VECTOR_TOP_K=50`, `FINAL_TOP_K=5`, threshold, TTL, latency budget.
 - `src/timing.py` — `StageTimer` context manager and `TimingAggregator` for p50/p95/p99 per stage.
-- `scripts/load_corpus.py` — downloads MS MARCO dev/small, builds the 10k corpus, indexes ChromaDB.
+- `scripts/load_corpus.py` — builds the 10k corpus and ChromaDB index. `--dataset msmarco-dev-small` (default, binary qrels) or `--dataset trec-dl-2019/2020` (graded qrels 0–3, hard negatives prioritised over random distractors).
 - `scripts/build_gold_set.py` — optional: builds the 1k/200-query gold evaluation subset.
 - `scripts/benchmark.py` — offline quality benchmark against the 1k gold-set corpus. Outputs `results/benchmark_results.json`.
-- `scripts/benchmark_corpus.py` — offline quality + latency benchmark against the 10k production corpus. Outputs `results/benchmark_corpus_results.json`.
+- `scripts/benchmark_corpus.py` — offline quality + latency benchmark against the 10k production corpus. Auto-detects graded vs binary qrels from `queries.json`. Outputs `results/benchmark_corpus_results.json`.
 - `scripts/generate_paraphrases.py` — builds paraphrase-based cache-hit and recall-preservation evaluation sets.
 - `scripts/quick_bench.py` — ad hoc per-stage latency benchmark against a running server. Source of the breakdown table above.
 - `tests/test_latency_budget.py` — regression test for the reranker skip guard.

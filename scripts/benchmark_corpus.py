@@ -5,21 +5,26 @@ Conditions
   1. cold      — vector search only (no cache, no reranker). Baseline.
   2. reranked  — vector search top-100 then cross-encoder rerank.
   3. warm      — semantic-cache + reranker pipeline. Cache is pre-warmed with
-                 3 paraphrases of 50 sampled queries, then the full 200 are
-                 evaluated. Hit rate is reported separately.
+                 3 paraphrases of ~25% of eval queries, then all are evaluated.
+                 Hit rate is reported separately.
 
 Corpus / queries
 ----------------
-  data/corpus.parquet   — 10k passages (relevant + distractor passages from
-                          MS MARCO dev/small). Built by scripts/load_corpus.py.
-  data/queries.json     — all queries whose relevant doc is in the corpus.
-                          200 are sampled deterministically for evaluation.
+  data/corpus.parquet   — 10k passages. Built by scripts/load_corpus.py.
+  data/queries.json     — queries whose relevant doc is in the corpus.
+                          Up to 200 are sampled deterministically for eval.
+
+  Two qrel formats are supported (auto-detected):
+    - Binary (MS MARCO dev/small): {"relevant_doc_ids": [...]}
+      NDCG computed with grade=1 for every annotated relevant doc.
+    - Graded (TREC DL 2019/2020): {"relevance_grades": {"pid": 0-3, ...}}
+      NDCG computed with real grades — expect 0.65-0.75 range (honest).
 
 Metrics
 -------
   pytrec_eval at cutoffs @10, @20, @50, @100.
-    - NDCG  : binary relevance (grade=1 for every annotated relevant doc).
-    - MAP   : binary relevance.
+    - NDCG  : grade-weighted if graded qrels, binary otherwise.
+    - MAP   : binary relevance (grade>=1 counts as relevant).
     - Recall: binary relevance.
 
 Outputs
@@ -58,8 +63,8 @@ QUERIES_PATH = Path("data/queries.json")
 RESULTS_PATH = Path("results/benchmark_corpus_results.json")
 
 SEED = 42
-N_EVAL_QUERIES = 200
-N_PREWARM_QUERIES = 50
+N_EVAL_QUERIES = 200      # capped to available queries if fewer exist
+N_PREWARM_QUERIES = 50    # capped to ~25% of eval_qids at runtime
 PARAPHRASES_PER_QUERY = 3
 VECTOR_TOP_K = 100
 CUTOFFS = (10, 20, 50, 100)
@@ -85,11 +90,21 @@ def load_production_queries(
     qrels: dict[str, dict[str, int]] = {}
     for entry in raw:
         qid = entry["query_id"]
-        rel_ids = [d for d in entry["relevant_doc_ids"] if d in corpus_ids]
-        if not rel_ids:
-            continue
-        queries[qid] = entry["query_text"]
-        qrels[qid] = {pid: 1 for pid in rel_ids}
+        if "relevance_grades" in entry:
+            # TREC DL graded mode: preserve grades 0-3 for honest NDCG.
+            # Grade=0 entries that appear in top-k correctly lower NDCG.
+            graded = {pid: g for pid, g in entry["relevance_grades"].items() if pid in corpus_ids}
+            if not any(g >= 1 for g in graded.values()):
+                continue
+            queries[qid] = entry["query_text"]
+            qrels[qid] = graded
+        else:
+            # MS MARCO binary mode
+            rel_ids = [d for d in entry["relevant_doc_ids"] if d in corpus_ids]
+            if not rel_ids:
+                continue
+            queries[qid] = entry["query_text"]
+            qrels[qid] = {pid: 1 for pid in rel_ids}
     return queries, qrels
 
 
@@ -212,7 +227,8 @@ def main() -> None:
     eval_qids = sorted(random.Random(SEED).sample(all_qids, min(N_EVAL_QUERIES, len(all_qids))))
     eval_queries = {qid: queries[qid] for qid in eval_qids}
     eval_qrels = {qid: qrels[qid] for qid in eval_qids}
-    print(f"  sampled {len(eval_qids)} queries for evaluation")
+    n_prewarm = max(5, min(N_PREWARM_QUERIES, len(eval_qids) // 4))
+    print(f"  sampled {len(eval_qids)} queries for evaluation (prewarm: {n_prewarm})")
 
     print(f"\nLoading models: {EMBEDDING_MODEL}, {RERANKER_MODEL}")
     embedder = SentenceTransformer(EMBEDDING_MODEL)
@@ -296,7 +312,7 @@ def main() -> None:
         ttl_hours=CACHE_TTL_HOURS,
     )
 
-    sampled_qids = rng.sample(eval_qids, N_PREWARM_QUERIES)
+    sampled_qids = rng.sample(eval_qids, n_prewarm)
     sampled_set = set(sampled_qids)
     n_cache_writes = 0
     for qid in sampled_qids:
@@ -320,7 +336,7 @@ def main() -> None:
             cache.set(emb, payload, corpus_version=CORPUS_VERSION)
             n_cache_writes += 1
     print(
-        f"  pre-warmed cache: {N_PREWARM_QUERIES} queries x "
+        f"  pre-warmed cache: {n_prewarm} queries x "
         f"{PARAPHRASES_PER_QUERY} paraphrases -> {n_cache_writes} entries stored"
     )
 
@@ -364,10 +380,10 @@ def main() -> None:
         warm_run[qid] = {r["doc_id"]: float(r["score"]) for r in results[:VECTOR_TOP_K]}
     warm_metrics = aggregate_run(warm_run, eval_qrels)
     warm_metrics["p95_latency_ms"] = percentile(warm_lat, 95)
-    n_unseen = len(eval_qids) - len(sampled_qids)
+    n_unseen = len(eval_qids) - n_prewarm
     warm_metrics["cache_hit_rate"] = (prewarm_hits + unseen_hits) / len(eval_qids)
     warm_metrics["cache_p95_latency_ms"] = percentile(warm_hit_lat, 95)
-    prewarm_hit_rate = prewarm_hits / max(1, len(sampled_qids))
+    prewarm_hit_rate = prewarm_hits / max(1, n_prewarm)
     unseen_hit_rate = unseen_hits / max(1, n_unseen)
     print(
         f"  done: NDCG@10={warm_metrics['ndcg@10']:.3f} "
@@ -429,8 +445,8 @@ def main() -> None:
         f"({prewarm_hits + unseen_hits}/{len(eval_qids)})"
     )
     print(
-        f"  cache hit rate (pre-warmed 50): {prewarm_hit_rate:.1%} "
-        f"({prewarm_hits}/{len(sampled_qids)})"
+        f"  cache hit rate (pre-warmed {n_prewarm}): {prewarm_hit_rate:.1%} "
+        f"({prewarm_hits}/{n_prewarm})"
     )
     print(
         f"  cache hit rate (unseen 150):    {unseen_hit_rate:.1%} "
