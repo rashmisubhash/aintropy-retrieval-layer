@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+chromadb
+sentence-transformers
+ir_datasets
+pytrec_eval-terrier
+numpy
+pandas
+pydantic
+httpx
+matplotlib
