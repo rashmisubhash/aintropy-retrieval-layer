@@ -97,6 +97,8 @@ query embedding  →  SHA-256(rounded to 4dp)  →  dict key
 
 On a cache miss the query embedding is sent to ChromaDB, which runs approximate nearest-neighbour search and returns the **top-50 passages** (`VECTOR_TOP_K = 50`) with their texts. ChromaDB runs in-process for the POC. The integration surface is a single `.query()` call in `src/retrieval.py`, making a swap to Pinecone, Milvus, or Qdrant a localised change.
 
+ChromaDB uses an **HNSW (Hierarchical Navigable Small World)** index internally — a multi-layer graph where the top layers connect distant points coarsely and the bottom layers connect close neighbors densely. A query traverses top-down, narrowing candidates at each layer, reaching approximate nearest neighbors in O(log N) rather than scanning the full corpus. The tradeoff is approximation: rare edge cases may miss the exact top match, but recall in practice is very close to exact search at a fraction of the cost.
+
 ### 4. Latency Budget Guard
 
 After vector search, elapsed time is checked against a **400ms budget** (`RERANK_SKIP_THRESHOLD_MS`). If the budget is already spent, the service returns the vector top-5 directly and marks the response:
@@ -151,6 +153,26 @@ Three endpoints:
 ---
 
 ## Architecture
+
+Full two-stage diagrams (ingestion + query) with production targets and improvement levers are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+### Ingestion Pipeline
+
+```mermaid
+flowchart LR
+    A["Document Sources\nAPIs / Files / DBs"] --> B[/"Kafka Topic\nraw-documents"/]
+    B --> C["Worker Pool\nBatch Consumers\n(horizontally scalable)"]
+    C --> D["Clean · Chunk · Expand"]
+    D --> E["Embedding Model"]
+    E --> F[("Vector DB\nSolr / Qdrant / Weaviate")]
+    F --> G["HNSW Index\nbuilt internally\nANN graph for fast kNN"]
+
+    style B fill:#f0a540,color:#000
+    style F fill:#4a90d9,color:#fff
+    style G fill:#2d6fa3,color:#fff
+```
+
+### Query Pipeline
 
 ```mermaid
 flowchart LR
